@@ -18,4 +18,3 @@ saved_logits_new/*
 Unnused_logit_files/*
 saved_logits_TESTSET/*
 saved_logits_gaussianmask/*
-checkpoints/*.pt
