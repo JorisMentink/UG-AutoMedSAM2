@@ -1,0 +1,526 @@
+from contextlib import nullcontext
+from PIL import Image
+import numpy as np
+import torch
+from scipy.ndimage import distance_transform_edt
+
+def normalize_mri_to_uint8(volume: np.ndarray, p_low: float = 1.0, p_high: float = 99.0) -> np.ndarray:
+    """"Normalizes a 3D MRI volume to uint8 using percentile clipping."""
+
+    vol = volume.astype(np.float32)
+    lo, hi = np.percentile(vol, (p_low, p_high))
+    vol = np.clip(vol, lo, hi)
+    vol = (vol - lo) / (hi - lo + 1e-8)
+    vol = (vol * 255.0).astype(np.uint8)
+    return vol
+
+
+def resize_grayscale_stack_to_rgb(volume_uint8: np.ndarray, image_size: int) -> np.ndarray:
+    "resizes grayscale to 3 channels, required for MedSAM2 inference."
+    
+    d, h, w = volume_uint8.shape
+    out = np.zeros((d, 3, image_size, image_size), dtype=np.float32)
+    for i in range(d):
+        img_pil = Image.fromarray(volume_uint8[i])
+        img_rgb = img_pil.convert("RGB")
+        img_resized = img_rgb.resize((image_size, image_size))
+        arr = np.asarray(img_resized, dtype=np.float32) / 255.0
+        out[i] = arr.transpose(2, 0, 1)
+    return out
+
+def run_medsam2_inference_from_arrays(
+    vol: np.ndarray,
+    predictor,
+    image_size: int,
+    prompts_by_slice: dict[int, tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, np.ndarray | None]],
+    p_low: float = 1.0,
+    p_high: float = 99.0,
+    threshold: float = 0.0,
+    propagation_style: str = "default",
+    nr_propagation_slices: int = 2,
+    slice_bounds = None,
+):
+    """Function that runs MedSAM2 inference on a 3D volume with prompts provided for specific slices.
+    INPUTS:
+    vol: 3D numpy array of the volume to segment (shape: D x H x W).
+    predictor: MedSAM2 predictor object.
+    image_size: Size to which each slice will be resized for inference (e.g.,
+    prompts_by_slice: Dictionary where keys are slice indices (z) and values are tuples containing:
+    p_low: Lower percentile for intensity normalization (default is 1.0).
+    p_high: Upper percentile for intensity normalization (default is 99.0).
+    threshold: Threshold for converting logits to binary segmentation (default is 0.0).
+    propagation_style: Strategy for propagating segmentation across slices.
+    nr_propagation_slices: Number of central slices to use for propagation when using 'central_partitions' strategy (default is 2).
+    slice_bounds: Optional tuple (start_slice, end_slice) to limit inference to a specific range of slices.
+
+    OUTPUTS:
+    segs_3d: 3D numpy array of the binary segmentation (shape: D x H x W).
+    logits_3d: 3D numpy array of the raw logits (shape: D x H x W).
+
+    """
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Device:", device)
+
+    torch.manual_seed(1604)
+    np.random.seed(1604)
+    
+    if device.type == "cuda":
+        torch.cuda.manual_seed(1604)
+
+    if vol.ndim != 3:
+        raise ValueError(f"Expected 3D volume, got {vol.shape}")
+    
+    if slice_bounds is not None:
+        start_slice, end_slice = slice_bounds
+        if not (0 <= start_slice <= end_slice < vol.shape[0]):
+            raise ValueError(f"Invalid slice_bounds {slice_bounds} for volume with shape {vol.shape}")
+
+    D, H, W = vol.shape
+    print("Volume shape (D,H,W):", (D, H, W))
+
+    vol_u8 = normalize_mri_to_uint8(vol, p_low=p_low, p_high=p_high)
+    frames = resize_grayscale_stack_to_rgb(vol_u8, image_size)
+
+    frames_t = torch.from_numpy(frames).to(device)
+    img_mean = torch.tensor((0.485, 0.456, 0.406), dtype=torch.float32, device=device)[:, None, None]
+    img_std = torch.tensor((0.229, 0.224, 0.225), dtype=torch.float32, device=device)[:, None, None]
+    frames_t = (frames_t - img_mean) / img_std
+
+    if hasattr(predictor, "to"):
+        predictor = predictor.to(device)
+
+    if hasattr(predictor, "model") and hasattr(predictor.model, "to"):
+        predictor.model = predictor.model.to(device)
+
+    autocast_ctx = (
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if device.type == "cuda"
+        else nullcontext()
+    )
+
+    segs_3d = np.zeros((D, H, W), dtype=np.uint8)
+    #For returning logits together with thresholded segmentation.
+    logits_3d = np.zeros((D, H, W), dtype=np.float32)
+    logit_count = np.zeros((D, H, W), dtype=np.float32)
+
+    def has_valid_prompt(points, point_labels, bbox, mask_input):
+        has_points = points is not None and point_labels is not None and len(points) > 0
+        has_box = bbox is not None
+
+        if mask_input is None:
+            has_mask = False
+        elif isinstance(mask_input, torch.Tensor):
+            has_mask = torch.any(mask_input > 0).item()
+        else:
+            has_mask = np.any(np.asarray(mask_input) > 0)
+
+        return has_points or has_box or has_mask
+
+    def add_prompt_for_slice(inference_state, slice_idx, points, point_labels, bbox, mask_input):
+        has_points = points is not None and point_labels is not None and len(points) > 0
+        has_box = bbox is not None
+
+        if mask_input is None:
+            has_mask = False
+        elif isinstance(mask_input, torch.Tensor):
+            has_mask = torch.any(mask_input > 0).item()
+        else:
+            has_mask = np.any(np.asarray(mask_input) > 0)
+
+        if not (has_points or has_box or has_mask):
+            raise ValueError(f"No valid prompts found for slice {slice_idx}")
+
+        #print(f"Adding prompt(s) on slice {slice_idx}")
+
+        predictor.add_prompts(
+            inference_state=inference_state,
+            frame_idx=slice_idx,
+            obj_id=1,
+            points=points if has_points else None,
+            labels=point_labels if has_points else None,
+            box=bbox if has_box else None,
+            mask_input=mask_input if has_mask else None,
+        )
+
+    def unpack_prompt(prompt):
+        "Function to unpack prompt dicts to boolean format, compatible with rest of inference pipeline"
+        
+        if isinstance(prompt, dict):
+            return (
+                prompt.get("points", None),
+                prompt.get("point_labels", None),
+                prompt.get("bbox", None),
+                prompt.get("mask_input", None),
+            )
+
+        return prompt
+
+    valid_slice_indices = [
+        slice_idx
+        for slice_idx in sorted(prompts_by_slice.keys())
+        if has_valid_prompt(*unpack_prompt(prompts_by_slice[slice_idx]))
+    ]
+    
+    #SETTING START AND ENDING BOUNDS IF SPECIFIED
+    bound_start, bound_end = (
+        slice_bounds if slice_bounds is not None
+        else (0, D - 1)
+    )
+
+    if slice_bounds is not None:
+        valid_slice_indices = [
+            z for z in valid_slice_indices
+            if bound_start <= z <= bound_end
+        ]
+
+        if len(valid_slice_indices) == 0:
+            raise ValueError(
+                f"No prompted slices found inside slice_bounds={slice_bounds}."
+            )
+
+    #Helper functions to compute maximum propagation slices from a given starting slice to the bounds given
+    def forward_max(start_slice):
+        return bound_end - start_slice
+
+    def backward_max(start_slice):
+        return start_slice - bound_start
+
+
+    with torch.inference_mode(), autocast_ctx:
+        inference_state = predictor.init_state(frames_t, H, W)
+
+        print("Using prompts from slices:", valid_slice_indices)
+
+        for slice_idx in valid_slice_indices:
+            points, point_labels, bbox, mask_input = unpack_prompt(prompts_by_slice[slice_idx])
+            add_prompt_for_slice(inference_state, slice_idx, points, point_labels, bbox, mask_input)
+
+        # Propagation strategies:
+
+        #Default propagation: propagate forward and backward from the first prompted slice.
+        if propagation_style == "default":
+
+            start_fwd = min(valid_slice_indices)
+            start_bwd = max(valid_slice_indices)
+
+            print(f"Forward propagation (default, from slice {start_fwd})...")
+            for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
+                inference_state,
+                start_frame_idx=start_fwd,
+                max_frame_num_to_track=forward_max(start_fwd),
+            ):
+                logit2d = out_mask_logits[0].detach().cpu().numpy()[0].astype(np.float32)
+                logits_3d[out_frame_idx] += logit2d
+                logit_count[out_frame_idx] += 1
+
+            print(f"Backward propagation (default, from slice {start_bwd})...")
+            for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
+                inference_state,
+                start_frame_idx=start_bwd,
+                reverse=True,
+                max_frame_num_to_track=backward_max(start_bwd),
+            ):
+                logit2d = out_mask_logits[0].detach().cpu().numpy()[0].astype(np.float32)
+                logits_3d[out_frame_idx] += logit2d
+                logit_count[out_frame_idx] += 1
+
+            valid = logit_count > 0
+            logits_3d[valid] = logits_3d[valid] / logit_count[valid]
+            segs_3d = (logits_3d > threshold).astype(np.uint8)
+
+        #Full propagation: do a full forward and backward pass of propagation.
+        elif propagation_style == "full":
+
+            print(f"Forward propagation (full, from slice {bound_start})...")
+            for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
+                inference_state,
+                start_frame_idx=bound_start,
+                max_frame_num_to_track=bound_end - bound_start,
+            ):
+                logit2d = out_mask_logits[0].detach().cpu().numpy()[0].astype(np.float32)
+                logits_3d[out_frame_idx] += logit2d
+                logit_count[out_frame_idx] += 1
+
+            print(f"Backward propagation (full, from slice {bound_end})...")
+            for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
+                inference_state,
+                start_frame_idx=bound_end,
+                reverse=True,
+                max_frame_num_to_track=bound_end - bound_start,
+            ):
+                logit2d = out_mask_logits[0].detach().cpu().numpy()[0].astype(np.float32)
+                logits_3d[out_frame_idx] += logit2d
+                logit_count[out_frame_idx] += 1
+
+            valid = logit_count > 0
+            logits_3d[valid] = logits_3d[valid] / logit_count[valid]
+            segs_3d = (logits_3d > threshold).astype(np.uint8)
+
+        #Smart propagation: propagate forward from the first prompted slice and backwards from the last slice
+        elif propagation_style == "prompt_based":
+
+            start_fwd = min(valid_slice_indices)
+            start_bwd = max(valid_slice_indices)
+
+            print(f"Forward propagation (prompt_based, from slice {start_fwd})...")
+            for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
+                inference_state,
+                start_frame_idx=start_fwd,
+                max_frame_num_to_track=forward_max(start_fwd),
+            ):
+                logit2d = out_mask_logits[0].detach().cpu().numpy()[0].astype(np.float32)
+                logits_3d[out_frame_idx] += logit2d
+                logit_count[out_frame_idx] += 1
+
+            print(f"Backward propagation (prompt_based, from slice {start_bwd})...")
+            for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
+                inference_state,
+                start_frame_idx=start_bwd,
+                reverse=True,
+                max_frame_num_to_track=backward_max(start_bwd),
+            ):
+                logit2d = out_mask_logits[0].detach().cpu().numpy()[0].astype(np.float32)
+                logits_3d[out_frame_idx] += logit2d
+                logit_count[out_frame_idx] += 1
+
+            valid = logit_count > 0
+            logits_3d[valid] = logits_3d[valid] / logit_count[valid]
+            segs_3d = (logits_3d > threshold).astype(np.uint8)
+            
+        
+        #Central propagation: propagate forward and backward from a central slice (e.g. middle slice or middle prompted slice).
+        elif propagation_style == "central_start":
+
+            start_mid = sorted(valid_slice_indices)[len(valid_slice_indices) // 2]
+
+            print(f"Forward propagation (central_start, from slice {start_mid})...")
+            for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
+                inference_state,
+                start_frame_idx=start_mid,
+                max_frame_num_to_track=forward_max(start_mid),
+            ):
+                logit2d = out_mask_logits[0].detach().cpu().numpy()[0].astype(np.float32)
+                logits_3d[out_frame_idx] += logit2d
+                logit_count[out_frame_idx] += 1
+
+            print(f"Backward propagation (central_start, from slice {start_mid})...")
+            for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
+                inference_state,
+                start_frame_idx=start_mid,
+                reverse=True,
+                max_frame_num_to_track=backward_max(start_mid),
+            ):
+                logit2d = out_mask_logits[0].detach().cpu().numpy()[0].astype(np.float32)
+                logits_3d[out_frame_idx] += logit2d
+                logit_count[out_frame_idx] += 1
+
+            valid = logit_count > 0
+            logits_3d[valid] = logits_3d[valid] / logit_count[valid]
+            segs_3d = (logits_3d > threshold).astype(np.uint8)
+
+        #central_partitions propagation: select multiple central slices (e.g. 2 or 3) as start points for propagation, by selecting the most central prompted slices. Propagate forward and backward from each of these central slices and combine results (e.g. by taking union of predicted masks).
+        elif propagation_style == "central_partitions":
+
+            valid_slice_indices = sorted(valid_slice_indices)
+
+
+            if nr_propagation_slices < 1:
+                raise ValueError(f"Number of propagation slices must be at least 1, got {nr_propagation_slices}.")
+            elif nr_propagation_slices > len(valid_slice_indices):
+                print(
+                    f"Requested {nr_propagation_slices} start slices, but only "
+                    f"{len(valid_slice_indices)} prompted slices are available. "
+                    f"Using all prompted slices instead."
+                )
+                start_slices = valid_slice_indices
+            else:
+                
+                positions = np.linspace(0,len(valid_slice_indices) - 1,nr_propagation_slices + 2)[1:-1]
+                selected_indices = [valid_slice_indices[int(round(pos))]for pos in positions]
+                start_slices = sorted(set(selected_indices))
+                print(f"Using central partition start slices: {start_slices}")
+
+            logit_sum = np.zeros((D, H, W), dtype=np.float32)
+            logit_count = np.zeros((D, H, W), dtype=np.float32)
+
+            for start_slice in start_slices:
+
+                print(f"Forward propagation from slice {start_slice}...")
+                for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
+                    inference_state,
+                    start_frame_idx=start_slice,
+                    max_frame_num_to_track=forward_max(start_slice),
+                ):
+                    logit2d = out_mask_logits[0].detach().cpu().numpy()[0].astype(np.float32)
+                    logit_sum[out_frame_idx] += logit2d
+                    logit_count[out_frame_idx] += 1
+
+                print(f"Backward propagation from slice {start_slice}...")
+                for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
+                    inference_state,
+                    start_frame_idx=start_slice,
+                    reverse=True,
+                    max_frame_num_to_track=backward_max(start_slice),
+                ):
+                    logit2d = out_mask_logits[0].detach().cpu().numpy()[0].astype(np.float32)
+                    logit_sum[out_frame_idx] += logit2d
+                    logit_count[out_frame_idx] += 1
+
+            valid_logits = logit_count > 0
+
+            avg_logits = np.zeros_like(logit_sum)
+            avg_logits[valid_logits] = logit_sum[valid_logits] / logit_count[valid_logits]
+
+            logits_3d = avg_logits
+            segs_3d = (logits_3d > threshold).astype(np.uint8)
+
+        else:
+            raise ValueError(f"Unknown propagation_style '{propagation_style}'. Choose from: 'default', 'full', 'prompt_based', 'central_start', 'central_partitions'.")
+
+        predictor.reset_state(inference_state)
+
+    return segs_3d, logits_3d
+
+def combine_prompt_sets(prompt_dict_list):
+    """
+    Combine multiple prompt dictionaries into a single prompt dictionary.
+
+    INPUTS:
+    prompt_dict_list : list of prompt dictionaries as made using the uncertainty handler
+
+    OUTPUTS:
+    combined : single prompt dictionary with all prompts combined in a format readable by the inference function
+    """
+
+    combined = {}
+
+    for prompt_dict in prompt_dict_list:
+
+        for z, prompt in prompt_dict.items():
+
+            # Create empty slice entry if needed
+            if z not in combined:
+                combined[z] = {
+                    "points": [],
+                    "point_labels": [],
+                    "bbox": None,
+                    "mask_input": None,
+                }
+
+            # Collect points
+            if prompt.get("points") is not None:
+                combined[z]["points"].append(prompt["points"])
+
+            if prompt.get("point_labels") is not None:
+                combined[z]["point_labels"].append(prompt["point_labels"])
+
+            # Keep the last bbox encountered
+            if prompt.get("bbox") is not None:
+                combined[z]["bbox"] = prompt["bbox"]
+
+            # Union mask inputs
+            if prompt.get("mask_input") is not None:
+                if combined[z]["mask_input"] is None:
+                    combined[z]["mask_input"] = prompt["mask_input"].copy()
+                else:
+                    combined[z]["mask_input"] = np.maximum(
+                        combined[z]["mask_input"],
+                        prompt["mask_input"]
+                    )
+
+    # Convert lists of points into arrays
+    for z in combined:
+
+        if len(combined[z]["points"]) > 0:
+            combined[z]["points"] = np.concatenate(
+                combined[z]["points"], axis=0
+            )
+            combined[z]["point_labels"] = np.concatenate(
+                combined[z]["point_labels"], axis=0
+            )
+        else:
+            combined[z]["points"] = None
+            combined[z]["point_labels"] = None
+
+    return combined
+
+def compile_prompt_sets(prompt_dict_list, prompt_set_names, prompt_set_weights = None):
+
+    prompt_sets_dict = {}
+
+    for idx, name in enumerate(prompt_set_names):
+        
+        prompt_sets_dict[name] = (prompt_dict_list[idx],prompt_set_weights[idx])
+
+    return prompt_sets_dict
+
+
+def compute_contour_average(contours, spacing):
+    """
+    Compute an evenly weighted average contour from a list of 3D binary masks
+    using signed distance field (SDF) averaging slice-by-slice.
+
+    INPUTS:
+    contours : list of 3D binary masks (numpy arrays) to average
+    spacing : tuple of voxel spacing in (z, y, x) order
+    
+    OUTPUTS:
+    averaged_contour : 3D binary mask (numpy array) representing the averaged contour
+    """
+
+    contours = [np.asarray(c).astype(bool) for c in contours]
+    
+    #Compute equal weighting on all contours
+    n_contours = len(contours)
+    weights = np.ones(n_contours, dtype=np.float32) / n_contours
+
+    #Set shape
+    shape = contours[0].shape
+    averaged_slices = []
+
+    for z in range(shape[0]):
+
+        slice_contours = [c[z] for c in contours]
+        #Only look at the contours that have at least one positive pixel in the slic
+        valid_idx = [i for i, c in enumerate(slice_contours) if np.any(c)]
+
+        if len(valid_idx) == 0:
+            averaged_slices.append(np.zeros(shape[1:], dtype=bool))
+            continue
+
+        valid_contours = [slice_contours[i] for i in valid_idx]
+        valid_weights = weights[valid_idx]
+        #If only two contours exist on the slice, normalize weighting to sum to 1.0
+        valid_weights /= valid_weights.sum()
+
+        combined = np.zeros(shape[1:], dtype=bool)
+        for c in valid_contours:
+            combined |= c
+
+        #Use cropping to only perform SDF averaging on the region of interest: Significantly saves computational load and time
+        ys, xs = np.where(combined)
+        pad_y = pad_x = 50
+        y0 = max(0, ys.min() - pad_y)
+        y1 = min(shape[1], ys.max() + pad_y + 1)
+        x0 = max(0, xs.min() - pad_x)
+        x1 = min(shape[2], xs.max() + pad_x + 1)
+        crop = (slice(y0, y1), slice(x0, x1))
+        sdf_sum = np.zeros((y1 - y0, x1 - x0), dtype=np.float32)
+
+        for contour, weight in zip(valid_contours, valid_weights):
+
+            contour_crop = contour[crop]
+
+            outside = distance_transform_edt(~contour_crop, sampling=spacing[1:])
+            inside = distance_transform_edt(contour_crop, sampling=spacing[1:])
+
+            sdf = outside - inside
+            sdf_sum += weight * sdf
+
+        averaged_slice = np.zeros(shape[1:], dtype=bool)
+        averaged_slice[crop] = sdf_sum <= 0
+
+        averaged_slices.append(averaged_slice)
+
+    return np.stack(averaged_slices, axis=0)

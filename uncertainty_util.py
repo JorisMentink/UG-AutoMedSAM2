@@ -1,0 +1,511 @@
+import numpy as np
+from scipy.ndimage import binary_erosion, center_of_mass
+
+def extract_bands(seg, unc_map):
+    """
+    Function that extracts:
+    - seg_edge: the edge of the segmentation
+    - unc_inner: the inner part of the uncertainty band (uncertainty pixels that are inside the segmentation, excluding the edge)
+    - unc_outer: the outer part of the uncertainty band (uncertainty pixels that are outside the segmentation)
+    - unc_edge_inner: the inner edge of the uncertainty band (uncertainty pixels on the inner edge of the segmentation)
+    - unc_edge_outer: the outer edge of the uncertainty band (uncertainty pixels on the outer edge of the segmentation)
+
+    From a given binary uncertainty map: unc_map
+    """
+
+    #Change maps into boolean for easier operations
+    seg = seg.astype(bool)
+    unc_map = unc_map.astype(bool)
+
+    seg_edge = seg & ~binary_erosion(seg) #Finds edge of the segmentation by isolating eroded pixels
+
+    unc_inner = unc_map & seg & ~seg_edge #Finds all uncertainty pixels on the inside of the segmentation, excluding the edge
+    unc_outer = unc_map & ~seg #Finds all uncertainty pixels on the outside of the segmentation
+
+    unc_band_edges = binary_erosion(unc_map)
+    
+    unc_edge_inner = (unc_inner & ~binary_erosion(unc_inner)) & ~unc_band_edges #Inner edge of the uncertainty band
+    unc_edge_outer = (unc_outer & ~binary_erosion(unc_outer)) & ~unc_band_edges #Outer edge of the uncertainty
+
+    return seg_edge, unc_inner, unc_outer, unc_edge_inner, unc_edge_outer
+
+def order_segmentation_pixels(seg_edge):
+    """
+    Function that orders and indexes contour pixels of a mask in a clockwise manner.
+
+    INPUT:
+    seg_edge: 2D binary array representing the contour of a segmentation mask.
+
+    OUTPUT:
+    ordered_edge_pixels: 2D array of shape (N, 2) containing the ordered coordinates of the contour pixels.    
+    """
+
+    seg_edge = seg_edge.astype(bool)
+
+    coords = np.argwhere(seg_edge)
+
+    if coords.shape[0] == 0:
+        return []
+
+    # Store pixels as (y, x)
+    unvisited = set(map(tuple, coords))
+
+    start = tuple(coords[0])
+    current = start
+
+    ordered_edge_pixels = [current]
+    unvisited.remove(current)
+
+    kernel = [(0, 1),(1, 0),(0, -1),(-1, 0),(1, 1),(1, -1),(-1, -1),(-1, 1),]
+
+    while len(unvisited) > 0:
+        found_next = False
+
+        y, x = current
+
+        for dy, dx in kernel:
+            next_pixel = (y + dy, x + dx)
+
+            if next_pixel in unvisited:
+                ordered_edge_pixels.append(next_pixel)
+                unvisited.remove(next_pixel)
+                current = next_pixel
+                found_next = True
+                break
+
+        if not found_next:
+            break
+
+    return np.array(ordered_edge_pixels)
+
+
+def determine_band_thickness_mm_raycast(
+    seg,
+    unc_map,
+    unc_inner,
+    seg_edge,
+    unc_outer,
+    pixel_spacing=(1.0, 1.0, 1.0),
+    angle_step=1,
+    step_mm=None,
+    pad=5,
+):
+    """
+    Function that determines uncertainty band thickness at given points using raycasting from the center.
+
+    INPUTS:
+    seg: 2D binary array representing the segmentation mask.
+    unc_map: 2D binary array representing the uncertainty map.
+    unc_inner: 2D binary array representing the inner part of the uncertainty band.
+    seg_edge: 2D binary array representing the edge of the segmentation mask.
+    unc_outer: 2D binary array representing the outer part of the uncertainty band.
+    pixel_spacing: Tuple representing the pixel spacing in (z, y, x) format.
+    angle_step: Step size in degrees for raycasting angles.
+    step_mm: Step size in mm for raycasting. If None, it will be set to 1/4th of the minimum pixel spacing.
+    pad: Padding in pixels around the uncertainty region to check for. increasing this increases computation cost.
+
+    OUTPUTS:
+    Dictionary containing:
+    - center_of_mass_px: Tuple of (y, x) coordinates of the center of mass of the segmentation in pixel space.
+    - center_of_mass_mm: Tuple of (y, x) coordinates of the center of mass of the segmentation in mm space.
+    - angles_deg: Array of angles in degrees at which rays were cast.
+    """
+
+    #Set up masks for raycasting, convert to boolean for easier operations
+    seg = seg.astype(bool)
+    unc_map = unc_map.astype(bool)
+    unc_inner = unc_inner.astype(bool)
+    seg_edge = seg_edge.astype(bool)
+    unc_outer = unc_outer.astype(bool)
+
+    #Extract pixel spacing
+    spacing_y = pixel_spacing[1]
+    spacing_x = pixel_spacing[2]
+
+    #Basic sanity checks-
+    if not seg.any():
+        raise ValueError("Segmentation is empty.")
+    if not unc_map.any():
+        raise ValueError("Uncertainty map is empty.")
+
+    #Set step size for raycasting, is 1/4th of pixel spacing consistent with local normals method
+    if step_mm is None:
+        step_mm = min(spacing_y, spacing_x) * 0.25
+
+    #center of mass of segmentation
+    cy, cx = center_of_mass(seg)
+    h, w = seg.shape
+
+    #Compute bounding box round uncertainty region to make sure rays are not sampled throughout entire image
+    ys, xs = np.where(unc_map)
+    y_min, y_max = ys.min(), ys.max()
+    x_min, x_max = xs.min(), xs.max()
+
+    #center of bbox
+    cy_box = (y_min + y_max) / 2
+    cx_box = (x_min + x_max) / 2
+
+    #square bbox around uncertainty region (with padding)
+    half_size = max(y_max - y_min, x_max - x_min) / 2
+    half_size = int(np.ceil(half_size)) + pad
+
+    y0 = max(0, int(np.floor(cy_box - half_size)))
+    y1 = min(h, int(np.ceil(cy_box + half_size + 1)))
+    x0 = max(0, int(np.floor(cx_box - half_size)))
+    x1 = min(w, int(np.ceil(cx_box + half_size + 1)))
+
+    #Convert bbox to mm coords for ray clipping
+    y0_mm = y0 * spacing_y
+    y1_mm = (y1 - 1) * spacing_y
+    x0_mm = x0 * spacing_x
+    x1_mm = (x1 - 1) * spacing_x
+
+    #convert center of mass to mm coords
+    cy_mm = cy * spacing_y
+    cx_mm = cx * spacing_x
+
+    #Set maximum ray length for computational efficiency
+    max_length_mm = np.sqrt((h * spacing_y) ** 2 + (w * spacing_x) ** 2)
+
+    #set all angles of the rays to be cast
+    angles = np.arange(0, 360, angle_step)
+
+    #create storage lists for results
+    seg_mm = []
+    inner_mm = []
+    edge_mm = []
+    outer_mm = []
+    band_total_mm = []
+
+    #Loop over every angle to be sampled
+    for angle_deg in angles:
+        theta = np.deg2rad(angle_deg)
+
+        #convert direction of ray to mm space
+        dy_mm = np.sin(theta)
+        dx_mm = np.cos(theta)
+
+        #Distances along the ray
+        distances = np.arange(0, max_length_mm, step_mm)
+
+        #change ray coordintes to mm
+        ray_y_mm = cy_mm + distances * dy_mm
+        ray_x_mm = cx_mm + distances * dx_mm
+
+        #Clip the ray to remain inside decided bbox
+        valid = (
+            (ray_y_mm >= y0_mm) & (ray_y_mm <= y1_mm) &
+            (ray_x_mm >= x0_mm) & (ray_x_mm <= x1_mm)
+        )
+
+        ray_dist_mm = distances[valid]
+        ray_y_mm = ray_y_mm[valid]
+        ray_x_mm = ray_x_mm[valid]
+
+        #conver to pixel indices
+        ray_y = ray_y_mm / spacing_y
+        ray_x = ray_x_mm / spacing_x
+
+        iy = np.round(ray_y).astype(int)
+        ix = np.round(ray_x).astype(int)
+
+        #Keep only valid indices inside the image
+        inside = (iy >= 0) & (iy < h) & (ix >= 0) & (ix < w)
+        iy = iy[inside]
+        ix = ix[inside]
+        ray_dist_mm = ray_dist_mm[inside]
+
+        #sample along the rays
+        seg_hits = seg[iy, ix]
+        inner_hits = unc_inner[iy, ix]
+        edge_hits = seg_edge[iy, ix]
+        outer_hits = unc_outer[iy, ix]
+
+        #convert from pixel space to mm space
+        seg_len = np.sum(seg_hits) * step_mm
+        inner_len = np.sum(inner_hits) * step_mm
+        edge_len = np.sum(edge_hits) * step_mm
+        outer_len = np.sum(outer_hits) * step_mm
+
+        #compute total band length to store as seperate value (nice? i guess? haha?)
+        total_len = inner_len + edge_len + outer_len
+
+        #store final results
+        seg_mm.append(seg_len)
+        inner_mm.append(inner_len)
+        edge_mm.append(edge_len)
+        outer_mm.append(outer_len)
+        band_total_mm.append(total_len)
+
+    return {
+        "center_of_mass_px": (cy, cx),
+        "center_of_mass_mm": (cy_mm, cx_mm),
+        "angles_deg": angles,
+        "seg_mm": np.array(seg_mm),
+        "inner_mm": np.array(inner_mm),
+        "edge_mm": np.array(edge_mm),
+        "outer_mm": np.array(outer_mm),
+        "total_mm": np.array(inner_mm) + np.array(outer_mm),
+        "band_total_mm": np.array(band_total_mm),
+        "bbox_square_px": (y0, y1, x0, x1),
+        "step_mm": step_mm,
+    }
+
+def determine_band_thickness_mm_normals(
+    seg,
+    unc_inner,
+    seg_edge,
+    unc_outer,
+    ordered_edge_pixels,
+    interpix_dist=5,
+    pixel_interval=10,
+    pixel_spacing=(1.0, 1.0,1.0)
+):
+    """
+    Function that determines the uncertainty envelope width at sampled points of the contour.
+
+    INPUTS:
+    seg: 2D binary array representing the segmentation mask.
+    unc_inner: 2D binary array representing the inner part of the uncertainty band.
+    seg_edge: 2D binary array representing the edge of the segmentation mask.
+    unc_outer: 2D binary array representing the outer part of the uncertainty band.
+    ordered_edge_pixels: 2D array of shape (N, 2) containing the ordered coordinates of the contour pixels.
+    interpix_dist: Integer representing the number of pixels to skip when computing tangent vectors.
+    pixel_interval: Integer representing the interval at which to sample points along the contour.
+    pixel_spacing: Tuple representing the pixel spacing in (z, y, x) format.
+
+    OUTPUTS:
+    Dictionary containing:
+    - pixel_index: List of indices of the sampled contour pixels.
+    - pixel_yx: List of (y, x) coordinates of the sampled contour pixels
+    - tangent_yx: List of tangent vectors at the sampled contour pixels.
+    - outer_normal_yx: List of outer normal vectors at the sampled contour pixels.
+    - inner_normal_yx: List of inner normal vectors at the sampled contour pixels.
+    - outer_mm: List of distances in mm from the sampled contour pixels to the outer edge
+    - inner_mm: List of distances in mm from the sampled contour pixels to the inner edge
+    - total_mm: List of total distances in mm from the sampled contour pixels to the inner and outer edges combined.
+    """
+
+    ordered_edge_pixels = np.asarray(ordered_edge_pixels, dtype=float)
+    sy, sx = float(pixel_spacing[1]), float(pixel_spacing[2])
+    spacing_yx = np.array([sy, sx], dtype=float)
+    step_mm = min(sy, sx) * 0.25
+    n_pixels = len(ordered_edge_pixels)
+    H, W = seg.shape
+
+    if n_pixels < (2 * interpix_dist + 1):
+        return None
+
+    pixel_interval = max(1, int(pixel_interval))
+    interpix_dist = max(1, int(interpix_dist))
+
+    res_pixel_index = []
+    res_pixel_yx = []
+    res_tangent_yx = []
+    res_outer_normal_yx = []
+    res_inner_normal_yx = []
+    res_outer_mm = []
+    res_inner_mm = []
+    res_total_mm = []
+
+    results = []
+
+    n_samples = max(1, round(n_pixels / pixel_interval))
+
+    sample_indices = np.round(
+        np.linspace(0, n_pixels, n_samples, endpoint=False)
+    ).astype(int)
+
+    for pixel_index in sample_indices:
+        
+        y, x = ordered_edge_pixels[pixel_index]
+        pixel_yx = np.array([y, x], dtype=float)
+
+        #Compute the begin and end point to compute tangent vector, % for wrap-around indexing
+        idx1 = (pixel_index - interpix_dist) % n_pixels
+        idx2 = (pixel_index + interpix_dist) % n_pixels
+
+        tangent = ordered_edge_pixels[idx2] - ordered_edge_pixels[idx1]
+
+        norm = np.linalg.norm(tangent)
+        if norm == 0:
+            continue
+
+        tangent = tangent / norm
+
+        #Because pixels are ordered, outer and inner normals are defined as
+        outer_normal = np.array([-tangent[1], tangent[0]])
+        inner_normal = np.array([tangent[1], -tangent[0]])
+
+        def measure_band_mm(seg_edge, start_yx, normal_yx, band, max_search_mm=20.0):
+            """
+            March from start_yx along normal_yx and measure how many mm remain inside band.
+            normal_yx is in pixel coordinates.
+            """
+
+            normal_yx = np.asarray(normal_yx, dtype=float)
+            normal_mm = normal_yx * spacing_yx
+
+            normal_mm_norm = np.linalg.norm(normal_mm)
+            if normal_mm_norm == 0:
+                return 0.0
+
+            # Convert a physical step in mm back to pixel-space step
+            step_yx = (normal_mm / normal_mm_norm) * (step_mm / spacing_yx)
+
+            dist_mm = 0.0
+            pos_yx = np.asarray(start_yx, dtype=float).copy()
+
+            while dist_mm < max_search_mm:
+                pos_yx = pos_yx + step_yx
+                dist_mm += step_mm
+
+                yy = int(round(pos_yx[0]))
+                xx = int(round(pos_yx[1]))
+
+                if yy < 0 or yy >= H or xx < 0 or xx >= W:
+                    break
+
+                if not (band[yy, xx] or seg_edge[yy,xx]):
+                    break
+
+            return dist_mm
+        
+        outer_mm = measure_band_mm(
+            seg_edge=seg_edge,
+            start_yx=pixel_yx,
+            normal_yx=outer_normal,
+            band=unc_outer,
+        )
+
+        inner_mm = measure_band_mm(
+            seg_edge=seg_edge,
+            start_yx=pixel_yx,
+            normal_yx=inner_normal,
+            band=unc_inner,
+        )
+
+        total_mm = inner_mm + outer_mm
+
+        res_pixel_index.append(pixel_index)
+        res_pixel_yx.append(pixel_yx)
+        res_tangent_yx.append(tangent)
+        res_outer_normal_yx.append(outer_normal)
+        res_inner_normal_yx.append(inner_normal)
+        res_outer_mm.append(outer_mm)
+        res_inner_mm.append(inner_mm)
+        res_total_mm.append(total_mm)
+
+    # if len(res_total_mm) == 0:
+    #     return None
+
+    return {
+            "pixel_index": res_pixel_index,
+            "pixel_yx": res_pixel_yx,
+            "tangent_yx": res_tangent_yx,
+            "outer_normal_yx": res_outer_normal_yx,
+            "inner_normal_yx": res_inner_normal_yx,
+            "outer_mm": np.array(res_outer_mm),
+            "inner_mm": np.array(res_inner_mm),
+            "total_mm": np.array(res_total_mm),
+        }
+
+
+def compute_band_thickness(
+    mask,
+    unc_map_bin,
+    img_spacing,
+    method="local_normals",
+    interpix_dist=5,
+    pixel_interval=10,
+):
+    """Return the mean uncertainty-envelope thickness in mm for each slice."""
+
+    if method not in ("raycast", "local_normals"):
+        raise ValueError("Method must be either 'raycast' or 'local_normals'")
+
+    band_thickness_per_slice = []
+
+    for z in range(unc_map_bin.shape[0]):
+        seg = mask[z]
+        unc_bin = unc_map_bin[z]
+
+        if not seg.any() or not unc_bin.any():
+            band_thickness_per_slice.append(0.0)
+            continue
+
+        seg_edge, unc_inner, unc_outer, _, _ = extract_bands(seg, unc_bin)
+
+        try:
+            if method == "raycast":
+                res = determine_band_thickness_mm_raycast(
+                    seg=seg,
+                    unc_map=unc_bin,
+                    unc_inner=unc_inner,
+                    seg_edge=seg_edge,
+                    unc_outer=unc_outer,
+                    pixel_spacing=img_spacing,
+                    angle_step=10,
+                    step_mm=None,
+                    pad=5,
+                )
+
+            else:
+                res = determine_band_thickness_mm_normals(
+                    seg=seg,
+                    unc_inner=unc_inner,
+                    seg_edge=seg_edge,
+                    unc_outer=unc_outer,
+                    ordered_edge_pixels=order_segmentation_pixels(seg_edge),
+                    interpix_dist=interpix_dist,
+                    pixel_interval=pixel_interval,
+                    pixel_spacing=img_spacing,
+                )
+
+            if res is None:
+                band_thickness_per_slice.append(0.0)
+                continue
+
+            thickness = (
+                np.asarray(res["inner_mm"])
+                + np.asarray(res["outer_mm"])
+            )
+
+            band = float(np.mean(thickness)) if thickness.size else 0.0
+            band_thickness_per_slice.append(band)
+
+        except ValueError:
+            band_thickness_per_slice.append(0.0)
+
+    return band_thickness_per_slice
+
+
+def check_prompt_validity(pos_yx, neg_yx, seg, unc_bin):
+    """
+    Function that checks if generated prompt pair is valid according to criteria:
+    1. All prompts must be within the bounds of the image.
+    2. All positive prompts must be inside the segmentation, but not in the uncertainty band.
+    3. All negative prompts must be outside the segmentation, and not in the uncertainty band
+
+    INPUTS:
+    pos_yx: Tuple of (y, x) coordinates for the positive prompt.
+    neg_yx: Tuple of (y, x) coordinates for the negative prompt.
+    seg: 2D binary array representing the segmentation mask.
+    unc_bin: 2D binary array representing the uncertainty band.
+
+    OUTPUT:
+    valid: Boolean indicating if prompt pair is valid or not
+    """
+
+    H, W = seg.shape
+    py, px = np.round(pos_yx).astype(int)
+    ny, nx = np.round(neg_yx).astype(int)
+
+    return (
+        0 <= py < H and 0 <= px < W and #Check if positive point is within image bounds
+        0 <= ny < H and 0 <= nx < W and #Check if negative point is within image bounds
+        seg[py, px] and                 #Check if positive point is on segmentation edge
+        not unc_bin[py, px] and         #Check if positive point is not in uncertainty band
+        not seg[ny, nx] and             #Check if negative point is outside segmentation
+        not unc_bin[ny, nx]             #Check if negative point is not in uncertainty band 
+    )
