@@ -1,0 +1,21 @@
+.vscode/
+.DS_Store
+__pycache__/
+*-checkpoint.ipynb
+.venv
+*.egg*
+build/*
+_C.*
+*.nii.gz
+*.csv
+outputs/*
+checkpoints/*.pt
+*.pt
+data/*
+results/*
+For Midway Presentation/*
+saved_logits_new/*
+Unnused_logit_files/*
+saved_logits_TESTSET/*
+saved_logits_gaussianmask/*
+checkpoints/*.pt
