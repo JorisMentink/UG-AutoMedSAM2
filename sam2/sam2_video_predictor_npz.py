@@ -419,7 +419,7 @@ class SAM2VideoPredictorNPZ(SAM2Base):
         mask_input=None,
         normalize_coords=True,
     ):
-        """Custom add_prompts function native to [DONT FORGET TO ADD THE REPO NAME HERE HAHA], to bypass original (med)SAM2 API's and load mask prompts without binarization."""
+        """Custom add_prompts function native to UG-AutoMedSAM2, to bypass original (med)SAM2 API's and load mask prompts without binarization."""
 
         #Validity checks for the provided prompts
         if (points is not None) != (labels is not None):

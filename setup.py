@@ -39,6 +39,7 @@ EXTRA_PACKAGES = {
         "jupyter>=1.0.0",
         "opencv-python>=4.10.0",
         "eva-decord>=0.6.1",
+        "ipywidgets>=8.1", #ADDED OVER BASIC MEDSAM2 IMPLEMENTATION. USED FOR INTERACTIVE PLOTTING FUNCTION
     ],
     "interactive-demo": [
         "Flask>=3.0.3",

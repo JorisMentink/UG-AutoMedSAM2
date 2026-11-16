@@ -133,6 +133,8 @@ def run_medsam2_inference_from_arrays(
 
         #print(f"Adding prompt(s) on slice {slice_idx}")
 
+        #add_prompts is custom prompt loading function that supports non-binary mask prompts. does require use_mask_input_as_output as False though
+        #function origin inside sam2/utils/sam2_video_predictior_npz.py
         predictor.add_prompts(
             inference_state=inference_state,
             frame_idx=slice_idx,
